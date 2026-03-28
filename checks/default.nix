@@ -229,6 +229,7 @@ import ./shellcheck.nix args //
 import ./microvm-command.nix args //
 import ./imperative-template.nix args //
 import ./startup-shutdown.nix args //
+import ./virtiofs-store-overlay.nix args //
 import ./shutdown-command.nix args //
 
 builtins.foldl' (result: hypervisor:

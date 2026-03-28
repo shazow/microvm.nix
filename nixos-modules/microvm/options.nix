@@ -572,6 +572,35 @@ in
       '';
     };
 
+    idmapStoreOverlayLowerdir = mkOption {
+      type = types.bool;
+      default =
+        cfg.writableStoreOverlay != null &&
+        !cfg.storeOnDisk &&
+        lib.any ({ source, proto, ... }:
+          source == "/nix/store" && proto == "virtiofs"
+        ) cfg.shares;
+      defaultText = literalExpression ''
+        config.microvm.writableStoreOverlay != null
+        && !config.microvm.storeOnDisk
+        && lib.any ({ source, proto, ... }:
+          source == "/nix/store" && proto == "virtiofs"
+        ) config.microvm.shares
+      '';
+      description = ''
+        Whether to insert an idmapped bind mount between the read-only
+        host `/nix/store` share and the writable overlay lowerdir.
+
+        This works around a virtiofs userspace ownership issue where
+        the guest can otherwise see the lowerdir root as owned by
+        `nobody` instead of `root`.
+
+        This is enabled automatically for writable store overlays that
+        use a virtiofs-backed host `/nix/store` share. It currently
+        requires `boot.initrd.systemd.enable = true`.
+      '';
+    };
+
     graphics = {
       enable = mkOption {
         type = types.bool;
