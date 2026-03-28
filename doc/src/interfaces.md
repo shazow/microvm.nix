@@ -42,8 +42,9 @@ interfaces before starting a MicroVM:
 sudo ip tuntap add $IFACE_NAME mode tap user $USER
 ```
 
-**Note:** add `multi_queue` to this command line if the VM is configured
-with more than one CPU core.
+**Note:** add `multi_queue` to this command line if the VM resolves to
+more than one CPU core at runtime, including when using
+`microvm.vcpu = "`nproc`"`.
 
 When running MicroVMs through the `host` module, the tap network
 interfaces are created through a systemd service dependency.

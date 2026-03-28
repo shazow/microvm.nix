@@ -1,6 +1,6 @@
 { pkgs
 , microvmConfig
-, macvtapFds
+, macvtapFdCsvList
 , extractOptValues
 , extractParamValue
 , ...
@@ -8,7 +8,7 @@
 
 let
   inherit (pkgs) lib;
-  inherit (microvmConfig) vcpu mem balloon initialBalloonMem deflateOnOOM hotplugMem hotpluggedMem user interfaces volumes shares socket devices hugepageMem graphics storeDisk storeOnDisk kernel initrdPath credentialFiles vsock;
+  inherit (microvmConfig) hostName vcpu mem balloon initialBalloonMem deflateOnOOM hotplugMem hotpluggedMem user interfaces volumes shares socket devices hugepageMem graphics storeDisk storeOnDisk kernel initrdPath credentialFiles vsock;
   inherit (microvmConfig.cloud-hypervisor) platformOEMStrings extraArgs;
 
   # extract all the extra args that we merge with up front
@@ -95,7 +95,7 @@ let
     deflate_on_oom = "on";
   });
 
-  tapMultiQueue = vcpu > 1;
+  tapMultiQueue = true;
 
   # Multi-queue options
   mqOps = lib.optionalAttrs tapMultiQueue {
@@ -179,96 +179,135 @@ in {
     then throw "cloud-hypervisor will not change user"
     else if credentialFiles != {}
     then throw "cloud-hypervisor does not support credentialFiles"
-    else lib.escapeShellArgs (
-      [
+    else pkgs.writeShellScript "microvm-cloud-hypervisor-command" ''
+      set -e
+
+      args=(
         "${cloudhypervisorPkg}/bin/cloud-hypervisor"
-        "--cpus" "boot=${toString vcpu}"
+        "--cpus" "boot=$MICROVM_VCPU"
         "--watchdog"
-        "--kernel" kernelPath
-        "--initramfs" initrdPath
-        "--cmdline" kernelCmdLine
+        "--kernel" "${kernelPath}"
+        "--initramfs" "${initrdPath}"
+        "--cmdline" "${kernelCmdLine}"
         "--seccomp" "true"
-        "--memory" memOps
-        "--platform" platformOps
-      ]
-      ++
-      lib.optionals (!hasUserConsole) ["--console" "null"]
-      ++
-      lib.optionals (!hasUserSerial) ["--serial" "tty"]
-      ++
-      lib.optionals (vsockOpts != "") ["--vsock" vsockOpts]
-      ++
-      lib.optionals graphics.enable [
-        "--gpu" "socket=${graphics.socket}"
-      ]
-      ++
-      lib.optionals balloon [ "--balloon" balloonOps ]
-      ++
-      arg "--disk" (
-        lib.optional storeOnDisk (opsMapped ({
-          path = toString storeDisk;
-          readonly = "on";
-        } // mqOps))
-        ++
-        map ({ image, serial, direct, readOnly, imageType, ... }:
-          opsMapped (
-            {
-              path = toString image;
-              direct =
-                if direct
-                then "on"
-                else "off";
-              readonly =
-                if readOnly
-                then "on"
-                else "off";
-              image_type = toString imageType;
-            } //
-            lib.optionalAttrs (serial != null) {
-              inherit serial;
-            } //
-            mqOps
-          )
-        ) volumes
+        "--memory" "${memOps}"
+        "--platform" "${platformOps}"
       )
-      ++
-      arg "--fs" (map ({ proto, socket, tag, ... }:
-        if proto == "virtiofs"
-        then opsMapped {
-          inherit tag socket;
-        }
-        else throw "cloud-hypervisor supports only shares that are virtiofs"
-      ) shares)
-      ++
-      lib.optionals (socket != null) [ "--api-socket" socket ]
-      ++
-      arg "--net" (map ({ type, id, mac, ... }:
-        if type == "tap"
-        then opsMapped ({
-          tap = id;
-          inherit mac;
-        } // lib.optionalAttrs tapMultiQueue {
-          num_queues = toString (2 * vcpu);
-        })
-        else if type == "macvtap"
-        then opsMapped ({
-          fd = "[${lib.concatMapStringsSep "," toString macvtapFds.${id}}]";
-          inherit mac;
-        } // lib.optionalAttrs tapMultiQueue {
-          num_queues = toString (2 * vcpu);
-        })
-        else throw "Unsupported interface type ${type} for Cloud-Hypervisor"
-      ) interfaces)
-    )
-    + " " + # Move vfio-pci outside of
-    lib.concatStringsSep " " (
-      arg "--device" (
-        map ({ bus, path, ... }: {
-          pci = "path=/sys/bus/pci/devices/${path}";
-          usb = throw "USB passthrough is not supported on cloud-hypervisor";
-        }.${bus}) devices
-      )
-    ) + " " + lib.escapeShellArgs processedExtraArgs;
+
+      ${lib.optionalString (!hasUserConsole) ''
+        args+=("--console" "null")
+      ''}
+      ${lib.optionalString (!hasUserSerial) ''
+        args+=("--serial" "tty")
+      ''}
+      ${lib.optionalString (vsockOpts != "") ''
+        args+=("--vsock" "${vsockOpts}")
+      ''}
+      ${lib.optionalString graphics.enable ''
+        args+=("--gpu" "socket=${graphics.socket}")
+      ''}
+      ${lib.optionalString balloon ''
+        args+=("--balloon" "${balloonOps}")
+      ''}
+
+      disk_args=()
+      ${lib.optionalString storeOnDisk ''
+        disk="path=${storeDisk},readonly=on"
+        if [ "$MICROVM_TAP_MULTI_QUEUE" -eq 1 ]; then
+          disk="$disk,num_queues=$MICROVM_VCPU"
+        fi
+        disk_args+=("$disk")
+      ''}
+      ${lib.concatMapStrings ({ image, serial, direct, readOnly, imageType, ... }: ''
+        disk="path=${image},direct=${if direct then "on" else "off"},readonly=${if readOnly then "on" else "off"},image_type=${toString imageType}${lib.optionalString (serial != null) ",serial=${serial}"}"
+        if [ "$MICROVM_TAP_MULTI_QUEUE" -eq 1 ]; then
+          disk="$disk,num_queues=$MICROVM_VCPU"
+        fi
+        disk_args+=("$disk")
+      '') volumes}
+      ${
+        if hasArghSyntax then ''
+          for disk in "''${disk_args[@]}"; do
+            args+=("--disk" "$disk")
+          done
+        '' else ''
+          if [ "''${#disk_args[@]}" -gt 0 ]; then
+            args+=("--disk" "''${disk_args[@]}")
+          fi
+        ''
+      }
+
+      fs_args=()
+      ${lib.concatMapStrings ({ proto, socket, tag, ... }:
+        if proto == "virtiofs" then ''
+          fs_args+=("tag=${tag},socket=${socket}")
+        '' else throw "cloud-hypervisor supports only shares that are virtiofs"
+      ) shares}
+      ${
+        if hasArghSyntax then ''
+          for fs in "''${fs_args[@]}"; do
+            args+=("--fs" "$fs")
+          done
+        '' else ''
+          if [ "''${#fs_args[@]}" -gt 0 ]; then
+            args+=("--fs" "''${fs_args[@]}")
+          fi
+        ''
+      }
+
+      ${lib.optionalString (socket != null) ''
+        args+=("--api-socket" "${socket}")
+      ''}
+
+      net_args=()
+      ${lib.concatMapStrings ({ type, id, mac, ... }: ''
+        net="${
+          if type == "tap" then "tap=${id},mac=${mac}"
+          else if type == "macvtap" then "fd=[${macvtapFdCsvList id}],mac=${mac}"
+          else throw "Unsupported interface type ${type} for Cloud-Hypervisor"
+        }"
+        if [ "$MICROVM_TAP_MULTI_QUEUE" -eq 1 ]; then
+          net="$net,num_queues=$MICROVM_VCPU_X2"
+        fi
+        net_args+=("$net")
+      '') interfaces}
+      ${
+        if hasArghSyntax then ''
+          for net in "''${net_args[@]}"; do
+            args+=("--net" "$net")
+          done
+        '' else ''
+          if [ "''${#net_args[@]}" -gt 0 ]; then
+            args+=("--net" "''${net_args[@]}")
+          fi
+        ''
+      }
+
+      device_args=()
+      ${lib.concatMapStrings ({ bus, path, ... }: {
+        pci = ''
+          device_args+=("path=/sys/bus/pci/devices/${path}")
+        '';
+        usb = throw "USB passthrough is not supported on cloud-hypervisor";
+      }.${bus}) devices}
+      ${
+        if hasArghSyntax then ''
+          for device in "''${device_args[@]}"; do
+            args+=("--device" "$device")
+          done
+        '' else ''
+          if [ "''${#device_args[@]}" -gt 0 ]; then
+            args+=("--device" "''${device_args[@]}")
+          fi
+        ''
+      }
+
+      ${lib.concatMapStrings (arg: ''
+        args+=(${lib.escapeShellArg arg})
+      '') processedExtraArgs}
+
+      ${if microvmConfig.prettyProcnames then ''exec -a "microvm@${hostName}"'' else "exec"} "''${args[@]}" "$@"
+    '';
 
   canShutdown = socket != null;
 

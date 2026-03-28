@@ -12,7 +12,7 @@ let
   vfkitPkg = microvmConfig.vfkit.package;
 
   inherit (microvmConfig)
-    vcpu mem user interfaces shares socket
+    hostName vcpu mem user interfaces shares socket
     storeOnDisk kernel initrdPath kernelParams
     balloon devices credentialFiles vsock graphics;
 
@@ -115,19 +115,40 @@ in
     then throw "vfkit vsock support not yet implemented in microvm.nix"
     else if storeOnDisk
     then throw "vfkit does not support storeOnDisk. Use virtiofs shares instead (already configured in examples)."
-    else
-      let
-        baseCmd = lib.escapeShellArgs allArgsWithoutSocket;
-        vfkitCmd = lib.concatStringsSep " " (map lib.escapeShellArg allArgsWithoutSocket);
-      in
-      # vfkit requires absolute socket paths, so expand relative paths
-      if socket != null
-      then "bash -c ${lib.escapeShellArg ''
-        SOCKET_ABS=${lib.escapeShellArg socket}
-        [[ "$SOCKET_ABS" != /* ]] && SOCKET_ABS="$PWD/$SOCKET_ABS"
-        exec ${vfkitCmd} --restful-uri "unix:///$SOCKET_ABS"
-      ''}"
-      else baseCmd;
+    else pkgs.writeShellScript "microvm-vfkit-command" ''
+      set -e
+
+      args=(
+        "${lib.getExe vfkitPkg}"
+        "--cpus" "$MICROVM_VCPU"
+        "--memory" "${toString mem}"
+      )
+
+      ${lib.optionalString (logLevel != null) ''
+        args+=("--log-level" "${logLevel}")
+      ''}
+      ${lib.optionalString graphics.enable ''
+        args+=("--gui")
+      ''}
+      ${lib.concatMapStrings (arg: ''
+        args+=(${lib.escapeShellArg arg})
+      '') bootloaderArgs}
+      ${lib.concatMapStrings (arg: ''
+        args+=(${lib.escapeShellArg arg})
+      '') deviceArgs}
+      ${lib.concatMapStrings (arg: ''
+        args+=(${lib.escapeShellArg arg})
+      '') extraArgs}
+      ${
+        if socket != null then ''
+          SOCKET_ABS=${lib.escapeShellArg socket}
+          [[ "$SOCKET_ABS" != /* ]] && SOCKET_ABS="$PWD/$SOCKET_ABS"
+          args+=("--restful-uri" "unix:///$SOCKET_ABS")
+        '' else ""
+      }
+
+      ${if microvmConfig.prettyProcnames then ''exec -a "microvm@${hostName}"'' else "exec"} "''${args[@]}" "$@"
+    '';
 
   canShutdown = socket != null;
 

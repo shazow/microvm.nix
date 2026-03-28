@@ -1,6 +1,7 @@
 { pkgs
 , microvmConfig
-, macvtapFds
+, macvtapFd
+, macvtapFdColonList
 , withDriveLetters
 , ...
 }:
@@ -125,7 +126,7 @@ let
     ) microvmConfig.interfaces) &&
     (builtins.elem "--enable-seccomp" (qemu.configureFlags or []));
 
-  tapMultiQueue = vcpu > 1;
+  tapMultiQueue = true;
 
   useHotPlugMemory = hotplugMem > 0;
 
@@ -163,190 +164,186 @@ lib.warnIf (mem == 2048) ''
 
   command = if initialBalloonMem != 0
   then throw "qemu does not support initialBalloonMem"
-  else lib.escapeShellArgs (
-    [
+  else pkgs.writeShellScript "microvm-qemu-command" ''
+    set -e
+
+    args=(
       "${qemu}/bin/qemu-system-${arch}"
-      "-name" hostName
-      "-M" machineConfig
-      "-m" (toString mem)
-      "-smp" (toString vcpu)
+      "-name" "${hostName}"
+      "-M" "${machineConfig}"
+      "-m" "${toString mem}"
+      "-smp" "$MICROVM_VCPU"
       "-nodefaults" "-no-user-config"
-      # qemu just hangs after shutdown, allow to exit by rebooting
       "-no-reboot"
-
       "-kernel" "${kernelPath}"
-      "-initrd" initrdPath
-
+      "-initrd" "${initrdPath}"
       "-chardev" "stdio,id=stdio,signal=off"
       "-device" "virtio-rng-${devType}"
-    ] ++ lib.optionals (machineId != null) [
-      "-smbios" "type=1,uuid=${machineId}"
-    ] ++
-      # Create PCIe root ports before vfio-pci devices that might require them
-      builtins.concatMap ({ id, bus, chassis, slot, addr, ... }:
-        [ "-device" "pcie-root-port,id=${id}${
-            lib.optionalString (bus != null) ",bus=${bus}" +
-            lib.optionalString (chassis != null) ",chassis=${toString chassis}" +
-            lib.optionalString (slot != null) ",slot=${slot}" +
-            lib.optionalString (addr != null) ",addr=${addr}"
-          }"
-        ]
-      ) pcieRootPorts
     )
-    + " " + # Move vfio-pci outside of escapeShellArgs
-    lib.concatStringsSep " " (lib.concatMap ({ bus, path, qemu,... }: {
-      pci = [
-        "-device" "vfio-pci,host=${path},multifunction=on${
+
+    ${lib.optionalString (machineId != null) ''
+      args+=("-smbios" "type=1,uuid=${machineId}")
+    ''}
+    ${lib.concatMapStrings ({ id, bus, chassis, slot, addr, ... }: ''
+      args+=("-device" "pcie-root-port,id=${id}${
+        lib.optionalString (bus != null) ",bus=${bus}" +
+        lib.optionalString (chassis != null) ",chassis=${toString chassis}" +
+        lib.optionalString (slot != null) ",slot=${slot}" +
+        lib.optionalString (addr != null) ",addr=${addr}"
+      }")
+    '') pcieRootPorts}
+    ${lib.concatMapStrings ({ bus, path, qemu, ... }: {
+      pci = ''
+        args+=("-device" "vfio-pci,host=${path},multifunction=on${
           lib.optionalString (qemu.id != null) ",id=${qemu.id}" +
           lib.optionalString (qemu.bus != null) ",bus=${qemu.bus}" +
-          # Allow to pass additional arguments to pci device
           lib.optionalString (qemu.deviceExtraArgs != null) ",${qemu.deviceExtraArgs}"
-        }"
-      ];
-      usb = [
-        "-device" "usb-host,${path}"
-      ];
-    }.${bus}) devices)
-    + " " +
-    lib.escapeShellArgs(
-    builtins.concatMap (fwCfgOption: ["-fw_cfg" fwCfgOption]) fwCfgOptions ++
-    lib.optionals serialConsole [
-      "-serial" "chardev:stdio"
-    ] ++
-    lib.optionals (vmHostPackages.stdenv.hostPlatform.isLinux && microvmConfig.cpu == null) [
-      "-enable-kvm"
-    ] ++
-    cpuArgs ++
-    lib.optionals (system == "x86_64-linux") [
-      "-device" "i8042"
-
-      "-append" "${kernelConsole} reboot=t panic=-1 ${toString microvmConfig.kernelParams}"
-    ] ++
-    lib.optionals (system == "aarch64-linux") [
-      "-append" "${kernelConsole} reboot=t panic=-1 ${toString microvmConfig.kernelParams}"
-    ] ++
-    lib.optionals storeOnDisk [
-      "-drive" "id=store,format=raw,read-only=on,file=${storeDisk},if=none,aio=${aioEngine}"
-      "-device" "virtio-blk-${devType},drive=store${lib.optionalString (devType == "pci") ",disable-legacy=on"}"
-    ] ++
-       (if graphics.enable then (
-       let
-         displayArgs = {
-           cocoa = [
-             "-display" "cocoa" "-device" "virtio-gpu"
-           ];
-           gtk = [
-             "-display" "gtk,gl=on" "-device" "virtio-vga-gl"
-           ];
-         }.${graphics.backend};
-       in
-         displayArgs ++ [
-           "-device" "qemu-xhci"
-           "-device" "usb-tablet"
-           "-device" "usb-kbd"
-         ]
-       ) else [ "-nographic" ]) ++
-    lib.optionals canSandbox [
-      "-sandbox" "on"
-    ] ++
-    lib.optionals (user != null) [ "-user" user ] ++
-    lib.optionals (socket != null) [ "-qmp" "unix:${socket},server,nowait" ] ++
-    lib.optionals balloon [
-	    "-device" ("virtio-balloon,free-page-reporting=on,id=balloon0" + lib.optionalString (deflateOnOOM) ",deflate-on-oom=on")
-    ] ++
-    lib.optionals useHotPlugMemory [
-      "-object" "memory-backend-ram,id=vmem0,size=${toString hotplugMem}M"
-      "-device" "virtio-mem-pci,id=vm0,memdev=vmem0,requested-size=${toString hotpluggedMem}M"
-    ] ++
-    builtins.concatMap ({ image, letter, serial, direct, readOnly, ... }:
-      [ "-drive"
-        "id=vd${letter},format=raw,file=${image},if=none,aio=${aioEngine},discard=unmap${
-          lib.optionalString (direct != null) ",cache=none"
-        },read-only=${if readOnly then "on" else "off"}"
-        "-device"
-        "virtio-blk-${devType},drive=vd${letter}${
-          lib.optionalString (serial != null) ",serial=${serial}"
-        }"
-      ]
-    ) volumes ++
-    lib.optionals (shares != []) (
-      (lib.optionals vmHostPackages.stdenv.hostPlatform.isLinux [
-        "-numa" "node,memdev=mem"
-        "-object" "memory-backend-memfd,id=mem,size=${toString mem}M,share=on"
-      ]) ++
-      builtins.concatMap ({ proto, index, socket, source, tag, securityModel, readOnly, ... }: {
-        "virtiofs" = [
-          "-chardev" "socket,id=fs${toString index},path=${socket}"
-          "-device" "vhost-user-fs-${devType},chardev=fs${toString index},tag=${tag}"
-        ];
-        "9p" = [
-          "-fsdev" "local,id=fs${toString index},path=${source},security_model=${securityModel},readonly=${lib.boolToString readOnly}"
-          "-device" "virtio-9p-${devType},fsdev=fs${toString index},mount_tag=${tag}"
-        ];
+        }")
+      '';
+      usb = ''
+        args+=("-device" "usb-host,${path}")
+      '';
+    }.${bus}) devices}
+    ${lib.concatMapStrings (fwCfgOption: ''
+      args+=("-fw_cfg" "${fwCfgOption}")
+    '') fwCfgOptions}
+    ${lib.optionalString serialConsole ''
+      args+=("-serial" "chardev:stdio")
+    ''}
+    ${lib.optionalString (vmHostPackages.stdenv.hostPlatform.isLinux && microvmConfig.cpu == null) ''
+      args+=("-enable-kvm")
+    ''}
+    ${lib.concatMapStrings (arg: ''
+      args+=(${lib.escapeShellArg arg})
+    '') cpuArgs}
+    ${lib.optionalString (system == "x86_64-linux") ''
+      args+=("-device" "i8042")
+      args+=("-append" ${lib.escapeShellArg "${kernelConsole} reboot=t panic=-1 ${toString microvmConfig.kernelParams}"})
+    ''}
+    ${lib.optionalString (system == "aarch64-linux") ''
+      args+=("-append" ${lib.escapeShellArg "${kernelConsole} reboot=t panic=-1 ${toString microvmConfig.kernelParams}"})
+    ''}
+    ${lib.optionalString storeOnDisk ''
+      args+=("-drive" "id=store,format=raw,read-only=on,file=${storeDisk},if=none,aio=${aioEngine}")
+      args+=("-device" "virtio-blk-${devType},drive=store${lib.optionalString (devType == "pci") ",disable-legacy=on"}")
+    ''}
+    ${
+      if graphics.enable then
+        let
+          displayArgs = {
+            cocoa = [
+              [ "-display" "cocoa" ]
+              [ "-device" "virtio-gpu" ]
+            ];
+            gtk = [
+              [ "-display" "gtk,gl=on" ]
+              [ "-device" "virtio-vga-gl" ]
+            ];
+          }.${graphics.backend};
+        in
+        lib.concatMapStrings (pair: ''
+          args+=(${lib.escapeShellArg (builtins.head pair)} ${lib.escapeShellArg (builtins.elemAt pair 1)})
+        '') (displayArgs ++ [
+          [ "-device" "qemu-xhci" ]
+          [ "-device" "usb-tablet" ]
+          [ "-device" "usb-kbd" ]
+        ])
+      else ''
+        args+=("-nographic")
+      ''
+    }
+    ${lib.optionalString canSandbox ''
+      args+=("-sandbox" "on")
+    ''}
+    ${lib.optionalString (user != null) ''
+      args+=("-user" "${user}")
+    ''}
+    ${lib.optionalString (socket != null) ''
+      args+=("-qmp" "unix:${socket},server,nowait")
+    ''}
+    ${lib.optionalString balloon ''
+      args+=("-device" "virtio-balloon,free-page-reporting=on,id=balloon0${lib.optionalString deflateOnOOM ",deflate-on-oom=on"}")
+    ''}
+    ${lib.optionalString useHotPlugMemory ''
+      args+=("-object" "memory-backend-ram,id=vmem0,size=${toString hotplugMem}M")
+      args+=("-device" "virtio-mem-pci,id=vm0,memdev=vmem0,requested-size=${toString hotpluggedMem}M")
+    ''}
+    ${lib.concatMapStrings ({ image, letter, serial, direct, readOnly, ... }: ''
+      args+=("-drive" "id=vd${letter},format=raw,file=${image},if=none,aio=${aioEngine},discard=unmap${lib.optionalString (direct != null) ",cache=none"},read-only=${if readOnly then "on" else "off"}")
+      args+=("-device" "virtio-blk-${devType},drive=vd${letter}${lib.optionalString (serial != null) ",serial=${serial}"}")
+    '') volumes}
+    ${lib.optionalString (shares != []) (
+      lib.optionalString vmHostPackages.stdenv.hostPlatform.isLinux ''
+        args+=("-numa" "node,memdev=mem")
+        args+=("-object" "memory-backend-memfd,id=mem,size=${toString mem}M,share=on")
+      '' +
+      lib.concatMapStrings ({ proto, index, socket, source, tag, securityModel, readOnly, ... }: {
+        "virtiofs" = ''
+          args+=("-chardev" "socket,id=fs${toString index},path=${socket}")
+          args+=("-device" "vhost-user-fs-${devType},chardev=fs${toString index},tag=${tag}")
+        '';
+        "9p" = ''
+          args+=("-fsdev" "local,id=fs${toString index},path=${source},security_model=${securityModel},readonly=${lib.boolToString readOnly}")
+          args+=("-device" "virtio-9p-${devType},fsdev=fs${toString index},mount_tag=${tag}")
+        '';
       }.${proto}) (enumerate 0 shares)
-    )
-    ++
-    lib.warnIf (
+    )}
+    ${lib.warnIf (
       forwardPorts != [] &&
       ! builtins.any ({ type, ... }: type == "user") interfaces
     ) "${hostName}: forwardPortsOptions only running with user network" (
-      builtins.concatMap ({ type, id, mac, bridge, tap ? {}, ... }: [
-        "-netdev" (
-          lib.concatStringsSep "," (
-            [
-              (if type == "macvtap" then "tap" else "${type}")
-              "id=${id}"
-            ]
-            ++ lib.optionals (type == "user" && forwardPorts != []) [
-              forwardingOptions
-            ]
-            ++ lib.optionals (type == "bridge") [
-              "br=${bridge}" "helper=/run/wrappers/bin/qemu-bridge-helper"
-            ]
-            ++ lib.optionals (type == "tap") [
-              "ifname=${id}"
-              "script=no" "downscript=no"
-            ]
-            ++ lib.optionals (type == "tap" && tap.vhost or false) [
-              "vhost=on"
-            ]
-            ++ lib.optionals (type == "macvtap") [ (
-              let
-                fds = macvtapFds.${id};
-              in
-                if builtins.length fds == 1
-                then "fd=${toString (builtins.head fds)}"
-                else "fds=${lib.concatMapStringsSep ":" toString fds}"
-            ) ]
-            ++ lib.optionals (type == "tap" && tapMultiQueue) [
-              "queues=${toString vcpu}"
-            ]
-          )
-        )
-        "-device" "virtio-net-${devType},netdev=${id},mac=${mac}${
-          # romfile= does not work with x86_64-linux and -M microvm
-          # setting or -cpu different than host
+      lib.concatMapStrings ({ type, id, mac, bridge, tap ? {}, ... }: ''
+        netdev="${if type == "macvtap" then "tap" else type},id=${id}"
+        ${lib.optionalString (type == "user" && forwardPorts != []) ''
+          netdev="$netdev,${forwardingOptions}"
+        ''}
+        ${lib.optionalString (type == "bridge") ''
+          netdev="$netdev,br=${bridge},helper=/run/wrappers/bin/qemu-bridge-helper"
+        ''}
+        ${lib.optionalString (type == "tap") ''
+          netdev="$netdev,ifname=${id},script=no,downscript=no"
+        ''}
+        ${lib.optionalString (type == "tap" && tap.vhost or false) ''
+          netdev="$netdev,vhost=on"
+        ''}
+        ${lib.optionalString (type == "macvtap") ''
+          if [ "$MICROVM_TAP_MULTI_QUEUE" -eq 1 ]; then
+            netdev="$netdev,fds=${macvtapFdColonList id}"
+          else
+            netdev="$netdev,fd=${macvtapFd id}"
+          fi
+        ''}
+        ${lib.optionalString (type == "tap") ''
+          if [ "$MICROVM_TAP_MULTI_QUEUE" -eq 1 ]; then
+            netdev="$netdev,queues=$MICROVM_VCPU"
+          fi
+        ''}
+        args+=("-netdev" "$netdev")
+
+        device="virtio-net-${devType},netdev=${id},mac=${mac}${
           lib.optionalString (
             requirePci ||
             (microvmConfig.cpu == null && system != "x86_64-linux")
           ) ",romfile="
-        }${
-          lib.optionalString (tapMultiQueue && requirePci) ",mq=on,vectors=${toString (2 * vcpu + 2)}"
         }"
-      ]) interfaces
-    )
-    ++
-    lib.optionals requireUsb [
-      "-device" "qemu-xhci"
-    ]
-    ++
-    lib.optionals (vsock.cid != null) [
-      "-device"
-      "vhost-vsock-${devType},guest-cid=${toString vsock.cid}"
-    ]
-    ++
-    extraArgs
-  );
+        if [ "$MICROVM_TAP_MULTI_QUEUE" -eq 1 ] && [ ${if requirePci then "1" else "0"} -eq 1 ]; then
+          device="$device,mq=on,vectors=$MICROVM_VCPU_X2_PLUS2"
+        fi
+        args+=("-device" "$device")
+      '') interfaces
+    )}
+    ${lib.optionalString requireUsb ''
+      args+=("-device" "qemu-xhci")
+    ''}
+    ${lib.optionalString (vsock.cid != null) ''
+      args+=("-device" "vhost-vsock-${devType},guest-cid=${toString vsock.cid}")
+    ''}
+    ${lib.concatMapStrings (arg: ''
+      args+=(${lib.escapeShellArg arg})
+    '') extraArgs}
+
+    ${if microvmConfig.prettyProcnames then ''exec -a "microvm@${hostName}"'' else "exec"} "''${args[@]}" "$@"
+  '';
 
   canShutdown = socket != null;
 
