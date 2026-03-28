@@ -14,7 +14,7 @@ The current branch demonstrates that the full end-to-end idea works, but it also
 
 Compared to `main`, the current branch changes:
 
-- `microvm.vcpu` from an integer-only option to an integer-or-special-string option
+- `microvm.vcpu` from an integer-only option to a string-or-int option
 - Runtime launch plumbing in `lib/runner.nix`
 - Host TAP setup in `nixos-modules/microvm/interfaces.nix`
 - macvtap FD handling in `lib/macvtap.nix`
@@ -46,8 +46,8 @@ Support runtime-resolved `microvm.vcpu` only for:
 
 - `microvm.vcpu` accepts either:
   - a positive integer
-  - the special string `` `nproc` ``
-- The special string is resolved on the runtime host
+  - a string value such as `` `nproc` ``
+- The string is resolved on the runtime host
 - The resolved value must be a positive integer
 
 ### Implementation boundaries
@@ -200,9 +200,9 @@ Fresh attempt guidance:
 - Do inline qemu arithmetic where required
 - Add derived helpers only when repeated backend usage proves they are worth it
 
-### 4. `virtiofsd.threadPoolSize` already established the `nproc` pattern
+### 4. `virtiofsd.threadPoolSize` already established the runtime-string pattern
 
-The current branch confirmed that `virtiofsd.threadPoolSize` already accepts the special string `\`nproc\``. It works because the string is interpolated directly into a shell command.
+The current branch confirmed that `virtiofsd.threadPoolSize` already accepts string values such as `\`nproc\``. It works because the string is interpolated directly into a shell command.
 
 Fresh attempt guidance:
 

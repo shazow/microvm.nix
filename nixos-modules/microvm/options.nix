@@ -105,8 +105,9 @@ in
       description = ''
         Number of virtual CPU cores.
 
-        For qemu, this option also takes the special string `\`nproc\`` which
-        uses as many virtual CPU cores as the host has cores.
+        For qemu, this option also takes string values in the same way as
+        `microvm.virtiofsd.threadPoolSize`. For example, the special string
+        `\`nproc\`` uses as many virtual CPU cores as the host has cores.
       '';
       default = 1;
       example = literalExpression ''"`nproc`"'';
