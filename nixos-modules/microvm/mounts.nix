@@ -1,7 +1,7 @@
-{ config, lib, ... }:
+{ config, lib, pkgs, utils, ... }:
 
 let
-  inherit (config.microvm) storeDiskType storeOnDisk writableStoreOverlay;
+  inherit (config.microvm) idmapStoreOverlayLowerdir storeDiskType storeOnDisk writableStoreOverlay;
 
   inherit (import ../../lib {
     inherit lib;
@@ -18,6 +18,8 @@ let
     then "/nix/.ro-store"
     else hostStore.mountPoint;
 
+  roStoreIdmapped = "/nix/.ro-store-idmapped";
+
   roStoreDisk =
     if storeOnDisk
     then
@@ -32,6 +34,21 @@ let
     mountPoint == config.microvm.writableStoreOverlay
     && proto == "virtiofs"
   ) config.microvm.shares;
+
+  enableIdmappedOverlayLowerdir =
+    idmapStoreOverlayLowerdir &&
+    config.boot.initrd.systemd.enable;
+
+  overlayLowerdir =
+    if enableIdmappedOverlayLowerdir
+    then roStoreIdmapped
+    else roStore;
+
+  initrdMountPrefix = "/sysroot";
+  roStoreMountInInitrd = "${initrdMountPrefix}${roStore}";
+  roStoreIdmappedMountInInitrd = "${initrdMountPrefix}${roStoreIdmapped}";
+  roStoreMountUnit = "${utils.escapeSystemdPath roStoreMountInInitrd}.mount";
+  storeOverlayMountUnit = "${utils.escapeSystemdPath "${initrdMountPrefix}/nix/store"}.mount";
 
 in
 lib.mkIf config.microvm.guest.enable {
@@ -83,7 +100,7 @@ lib.mkIf config.microvm.guest.enable {
       "/nix/store" = {
         neededForBoot = true;
         overlay = {
-          lowerdir = [ roStore ];
+          lowerdir = [ overlayLowerdir ];
           upperdir = "${writableStoreOverlay}/store";
           workdir = "${writableStoreOverlay}/work";
         };
@@ -137,4 +154,24 @@ lib.mkIf config.microvm.guest.enable {
     overrideStrategy = "asDropin";
     unitConfig.DefaultDependencies = false;
   } ];
+
+  boot.initrd.systemd.services = lib.mkIf enableIdmappedOverlayLowerdir {
+    # Map the virtiofs nobody-owned root back to uid/gid 0 before overlayfs uses it.
+    "microvm-idmap-ro-store" = {
+      requiredBy = [ storeOverlayMountUnit ];
+      before = [ storeOverlayMountUnit ];
+      requires = [ roStoreMountUnit ];
+      after = [ roStoreMountUnit ];
+      unitConfig = {
+        DefaultDependencies = false;
+        RequiresMountsFor = roStoreMountInInitrd;
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p -m 0755 ${roStoreIdmappedMountInInitrd}";
+        ExecStart = "${pkgs.util-linux}/bin/mount --bind -o X-mount.idmap=b:0:65534:1 ${roStoreMountInInitrd} ${roStoreIdmappedMountInInitrd}";
+      };
+    };
+  };
 }

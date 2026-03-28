@@ -1,6 +1,9 @@
 { config, lib, ... }:
 let
   inherit (config.networking) hostName;
+  hasVirtiofsStoreShare = lib.any ({ source, proto, ... }:
+    source == "/nix/store" && proto == "virtiofs"
+  ) config.microvm.shares;
 
 in
 lib.mkIf config.microvm.guest.enable {
@@ -104,6 +107,26 @@ lib.mkIf config.microvm.guest.enable {
         );
       message = ''
         MicroVM ${hostName}: `config.microvm.forwardPorts` works only with qemu and one network interface with `type = "user"`
+      '';
+    } {
+      assertion = config.microvm.idmapStoreOverlayLowerdir -> config.microvm.writableStoreOverlay != null;
+      message = ''
+        MicroVM ${hostName}: `microvm.idmapStoreOverlayLowerdir` requires `microvm.writableStoreOverlay` to be set.
+      '';
+    } {
+      assertion = config.microvm.idmapStoreOverlayLowerdir -> !config.microvm.storeOnDisk;
+      message = ''
+        MicroVM ${hostName}: `microvm.idmapStoreOverlayLowerdir` is only supported when `/nix/store` is shared from the host.
+      '';
+    } {
+      assertion = config.microvm.idmapStoreOverlayLowerdir -> hasVirtiofsStoreShare;
+      message = ''
+        MicroVM ${hostName}: `microvm.idmapStoreOverlayLowerdir` requires the host `/nix/store` share to use `proto = "virtiofs"`.
+      '';
+    } {
+      assertion = config.microvm.idmapStoreOverlayLowerdir -> config.boot.initrd.systemd.enable;
+      message = ''
+        MicroVM ${hostName}: `microvm.idmapStoreOverlayLowerdir` currently requires `boot.initrd.systemd.enable = true`.
       '';
     } ]
     ++
