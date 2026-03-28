@@ -1,6 +1,8 @@
 { config, lib, ... }:
 let
   inherit (config.networking) hostName;
+  stringVcpu = builtins.isString config.microvm.vcpu;
+  hasMacvtapInterfaces = builtins.any ({ type, ... }: type == "macvtap") config.microvm.interfaces;
 
 in
 lib.mkIf config.microvm.guest.enable {
@@ -97,6 +99,16 @@ lib.mkIf config.microvm.guest.enable {
     ++
     # blacklist forwardPorts
     [ {
+      assertion = !stringVcpu || config.microvm.hypervisor == "qemu";
+      message = ''
+        MicroVM ${hostName}: string `config.microvm.vcpu` is currently supported only with `microvm.hypervisor = "qemu"`.
+      '';
+    } {
+      assertion = !stringVcpu || !hasMacvtapInterfaces;
+      message = ''
+        MicroVM ${hostName}: qemu with string `config.microvm.vcpu` does not yet support interfaces with `type = "macvtap"`.
+      '';
+    } {
       assertion =
         config.microvm.forwardPorts != [] -> (
           config.microvm.hypervisor == "qemu" &&

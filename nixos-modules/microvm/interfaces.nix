@@ -7,8 +7,11 @@ let
 
   tapInterfaces = interfacesByType "tap";
   macvtapInterfaces = interfacesByType "macvtap";
+  dynamicQemuVcpu =
+    config.microvm.hypervisor == "qemu" &&
+    builtins.isString config.microvm.vcpu;
 
-  tapFlags = lib.concatStringsSep " " (
+  staticTapFlags = lib.concatStringsSep " " (
     [ "vnet_hdr" ] ++
     lib.optional config.microvm.declaredRunner.passthru.tapMultiQueue "multi_queue"
   );
@@ -22,12 +25,32 @@ in
     lib.mkIf (tapInterfaces != []) {
       tap-up = ''
         set -eou pipefail
+        TAP_FLAGS='${staticTapFlags}'
+      '' + lib.optionalString dynamicQemuVcpu ''
+        TAP_FLAGS='vnet_hdr'
+        MICROVM_TAP_VCPU=${toString config.microvm.vcpu}
+
+        case "$MICROVM_TAP_VCPU" in
+          ""|*[!0-9]*)
+            echo "tap-up: microvm.vcpu resolved to invalid value: $MICROVM_TAP_VCPU" >&2
+            exit 1
+            ;;
+        esac
+
+        if [ "$MICROVM_TAP_VCPU" -le 0 ]; then
+          echo "tap-up: microvm.vcpu must resolve to a positive integer: $MICROVM_TAP_VCPU" >&2
+          exit 1
+        fi
+
+        if [ "$MICROVM_TAP_VCPU" -gt 1 ]; then
+          TAP_FLAGS="$TAP_FLAGS multi_queue"
+        fi
       '' + lib.concatMapStrings ({ id, ... }: ''
         if [ -e /sys/class/net/${id} ]; then
           ${lib.getExe' pkgs.iproute2 "ip"} link delete '${id}'
         fi
 
-        ${lib.getExe' pkgs.iproute2 "ip"} tuntap add name '${id}' mode tap user '${user}' ${tapFlags}
+        ${lib.getExe' pkgs.iproute2 "ip"} tuntap add name '${id}' mode tap user '${user}' $TAP_FLAGS
         ${lib.getExe' pkgs.iproute2 "ip"} link set '${id}' up
       '') tapInterfaces;
 

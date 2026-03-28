@@ -23,6 +23,7 @@ let
   preStart = hypervisorConfig.preStart or microvmConfig.preStart;
   tapMultiQueue = hypervisorConfig.tapMultiQueue or false;
   setBalloonScript = hypervisorConfig.setBalloonScript or null;
+  dynamicVcpu = builtins.isString microvmConfig.vcpu;
 
   execArg = lib.optionalString microvmConfig.prettyProcnames ''-a "microvm@${hostName}"'';
 
@@ -174,6 +175,23 @@ let
         ${preStart}
         ${createVolumesScript microvmConfig.volumes}
         ${lib.optionalString (hypervisorConfig.requiresMacvtapAsFds or false) openMacvtapFds}
+        ${lib.optionalString dynamicVcpu ''
+          MICROVM_VCPU=${toString microvmConfig.vcpu}
+
+          case "$MICROVM_VCPU" in
+            ""|*[!0-9]*)
+              echo "microvm-run: microvm.vcpu resolved to invalid value: $MICROVM_VCPU" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ "$MICROVM_VCPU" -le 0 ]; then
+            echo "microvm-run: microvm.vcpu must resolve to a positive integer: $MICROVM_VCPU" >&2
+            exit 1
+          fi
+
+          export MICROVM_VCPU
+        ''}
         runtime_args=${
           lib.optionalString (microvmConfig.extraArgsScript != null) ''
             $(${microvmConfig.extraArgsScript})

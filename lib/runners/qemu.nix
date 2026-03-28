@@ -110,6 +110,7 @@ let
     else "device";
 
   kernelPath = "${kernel.out}/${pkgs.stdenv.hostPlatform.linux-kernel.target}";
+  dynamicVcpu = builtins.isString vcpu;
 
   enumerate = n: xs:
     if xs == []
@@ -125,7 +126,7 @@ let
     ) microvmConfig.interfaces) &&
     (builtins.elem "--enable-seccomp" (qemu.configureFlags or []));
 
-  tapMultiQueue = vcpu > 1;
+  tapMultiQueue = builtins.isInt vcpu && vcpu > 1;
 
   useHotPlugMemory = hotplugMem > 0;
 
@@ -152,6 +153,81 @@ let
   systemdCredentialStrings = lib.mapAttrsToList (name: path: "name=opt/io.systemd.credentials/${name},file=${path}" ) credentialFiles;
   fwCfgOptions = systemdCredentialStrings;
 
+  rawShellArg = value: { inherit value; };
+
+  renderArg = arg:
+    if builtins.isAttrs arg && arg ? value
+    then arg.value
+    else lib.escapeShellArg arg;
+
+  renderArgs = args: lib.concatStringsSep " " (map renderArg args);
+
+  qemuVcpuArg =
+    if dynamicVcpu
+    then rawShellArg ''"$MICROVM_VCPU"''
+    else toString vcpu;
+
+  tapQueuesSuffix =
+    if dynamicVcpu
+    then ''"$(if [ "$MICROVM_VCPU" -gt 1 ]; then printf ',queues=%s' "$MICROVM_VCPU"; fi)"''
+    else lib.optionalString tapMultiQueue ",queues=${toString vcpu}";
+
+  # TODO: keep queue/vector runtime arithmetic qemu-local until another backend
+  # actually needs the same shape.
+  netDeviceMqSuffix =
+    if dynamicVcpu
+    then ''"$(if [ "$MICROVM_VCPU" -gt 1 ]; then printf ',mq=on,vectors=%s' "$((2 * MICROVM_VCPU + 2))"; fi)"''
+    else lib.optionalString tapMultiQueue ",mq=on,vectors=${toString (2 * vcpu + 2)}";
+
+  netdevArg = { type, id, bridge, tap ? {}, ... }:
+    let
+      base = lib.concatStringsSep "," (
+        [
+          (if type == "macvtap" then "tap" else "${type}")
+          "id=${id}"
+        ]
+        ++ lib.optionals (type == "user" && forwardPorts != []) [
+          forwardingOptions
+        ]
+        ++ lib.optionals (type == "bridge") [
+          "br=${bridge}" "helper=/run/wrappers/bin/qemu-bridge-helper"
+        ]
+        ++ lib.optionals (type == "tap") [
+          "ifname=${id}"
+          "script=no" "downscript=no"
+        ]
+        ++ lib.optionals (type == "tap" && tap.vhost or false) [
+          "vhost=on"
+        ]
+        ++ lib.optionals (type == "macvtap") [ (
+          let
+            fds = macvtapFds.${id};
+          in
+            if builtins.length fds == 1
+            then "fd=${toString (builtins.head fds)}"
+            else "fds=${lib.concatMapStringsSep ":" toString fds}"
+        ) ]
+      );
+    in
+      if dynamicVcpu && type == "tap"
+      then rawShellArg (lib.escapeShellArg base + tapQueuesSuffix)
+      else base + lib.optionalString (type == "tap") tapQueuesSuffix;
+
+  netDeviceArg = { id, mac, ... }:
+    let
+      base = "virtio-net-${devType},netdev=${id},mac=${mac}${
+        # romfile= does not work with x86_64-linux and -M microvm
+        # setting or -cpu different than host
+        lib.optionalString (
+          requirePci ||
+          (microvmConfig.cpu == null && system != "x86_64-linux")
+        ) ",romfile="
+      }";
+    in
+      if dynamicVcpu && requirePci
+      then rawShellArg (lib.escapeShellArg base + netDeviceMqSuffix)
+      else base + lib.optionalString requirePci netDeviceMqSuffix;
+
 in
 lib.warnIf (mem == 2048) ''
   QEMU hangs if memory is exactly 2GB
@@ -163,13 +239,13 @@ lib.warnIf (mem == 2048) ''
 
   command = if initialBalloonMem != 0
   then throw "qemu does not support initialBalloonMem"
-  else lib.escapeShellArgs (
+  else renderArgs (
     [
       "${qemu}/bin/qemu-system-${arch}"
       "-name" hostName
       "-M" machineConfig
       "-m" (toString mem)
-      "-smp" (toString vcpu)
+      "-smp" qemuVcpuArg
       "-nodefaults" "-no-user-config"
       # qemu just hangs after shutdown, allow to exit by rebooting
       "-no-reboot"
@@ -208,7 +284,7 @@ lib.warnIf (mem == 2048) ''
       ];
     }.${bus}) devices)
     + " " +
-    lib.escapeShellArgs(
+    renderArgs(
     builtins.concatMap (fwCfgOption: ["-fw_cfg" fwCfgOption]) fwCfgOptions ++
     lib.optionals serialConsole [
       "-serial" "chardev:stdio"
@@ -291,48 +367,8 @@ lib.warnIf (mem == 2048) ''
       ! builtins.any ({ type, ... }: type == "user") interfaces
     ) "${hostName}: forwardPortsOptions only running with user network" (
       builtins.concatMap ({ type, id, mac, bridge, tap ? {}, ... }: [
-        "-netdev" (
-          lib.concatStringsSep "," (
-            [
-              (if type == "macvtap" then "tap" else "${type}")
-              "id=${id}"
-            ]
-            ++ lib.optionals (type == "user" && forwardPorts != []) [
-              forwardingOptions
-            ]
-            ++ lib.optionals (type == "bridge") [
-              "br=${bridge}" "helper=/run/wrappers/bin/qemu-bridge-helper"
-            ]
-            ++ lib.optionals (type == "tap") [
-              "ifname=${id}"
-              "script=no" "downscript=no"
-            ]
-            ++ lib.optionals (type == "tap" && tap.vhost or false) [
-              "vhost=on"
-            ]
-            ++ lib.optionals (type == "macvtap") [ (
-              let
-                fds = macvtapFds.${id};
-              in
-                if builtins.length fds == 1
-                then "fd=${toString (builtins.head fds)}"
-                else "fds=${lib.concatMapStringsSep ":" toString fds}"
-            ) ]
-            ++ lib.optionals (type == "tap" && tapMultiQueue) [
-              "queues=${toString vcpu}"
-            ]
-          )
-        )
-        "-device" "virtio-net-${devType},netdev=${id},mac=${mac}${
-          # romfile= does not work with x86_64-linux and -M microvm
-          # setting or -cpu different than host
-          lib.optionalString (
-            requirePci ||
-            (microvmConfig.cpu == null && system != "x86_64-linux")
-          ) ",romfile="
-        }${
-          lib.optionalString (tapMultiQueue && requirePci) ",mq=on,vectors=${toString (2 * vcpu + 2)}"
-        }"
+        "-netdev" (netdevArg { inherit type id bridge tap; })
+        "-device" (netDeviceArg { inherit id mac; })
       ]) interfaces
     )
     ++

@@ -102,9 +102,15 @@ in
     };
 
     vcpu = mkOption {
-      description = "Number of virtual CPU cores";
+      description = ''
+        Number of virtual CPU cores.
+
+        For qemu, this option also takes the special string `\`nproc\`` which
+        uses as many virtual CPU cores as the host has cores.
+      '';
       default = 1;
-      type = types.ints.positive;
+      example = literalExpression ''"`nproc`"'';
+      type = with types; either ints.positive str;
     };
 
     mem = mkOption {
