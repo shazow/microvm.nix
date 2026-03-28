@@ -102,9 +102,16 @@ in
     };
 
     vcpu = mkOption {
-      description = "Number of virtual CPU cores";
+      description = ''
+        Number of virtual CPU cores.
+
+        Like `microvm.virtiofsd.threadPoolSize`, string values are inserted
+        literally into the generated shell script. This means a backticked
+        command such as `\`nproc\`` is evaluated on the host running the
+        MicroVM and must resolve to a positive integer.
+      '';
       default = 1;
-      type = types.ints.positive;
+      type = with types; oneOf [ str ints.positive ];
     };
 
     mem = mkOption {

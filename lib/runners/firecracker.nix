@@ -27,7 +27,7 @@ let
       boot_args = "console=ttyS0,115200 noapic acpi=off reboot=k panic=1 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ${toString microvmConfig.kernelParams}";
     };
     machine-config = {
-      vcpu_count = vcpu;
+      vcpu_count = "__MICROVM_VCPU__";
       mem_size_mib = mem;
       # Without this, starting of firecracker fails with an error message:
       # Enabling simultaneous multithreading is not supported on aarch64
@@ -76,6 +76,7 @@ let
   config = lib.recursiveUpdate baseConfig microvmConfig.firecracker.extraConfig;
 
   configFile = pkgs.writers.writeJSON "firecracker-${hostName}.json" config;
+  runtimeConfigFile = "firecracker-${hostName}.json";
 
   firecrackerPkg = microvmConfig.firecracker.package;
 
@@ -97,20 +98,33 @@ in {
     then throw "hotpluggedMem not implemented for Firecracker"
     else if credentialFiles != {}
     then throw "credentialFiles are not implemented for Firecracker"
-    else lib.escapeShellArgs ([
-      "${firecrackerPkg}/bin/firecracker"
-      "--config-file" configFile
-      "--api-sock" (
-        if socket != null
-        then socket
-        else throw "Firecracker must be configured with an API socket (option microvm.socket)!"
-      )
-    ]
-    ++ lib.optional (lib.versionAtLeast firecrackerPkg.version "1.13.0") "--enable-pci"
-    ++ microvmConfig.firecracker.extraArgs);
+    else pkgs.writeShellScript "microvm-firecracker-command" ''
+      set -e
+
+      ${if microvmConfig.prettyProcnames then ''exec -a "microvm@${hostName}"'' else "exec"} ${firecrackerPkg}/bin/firecracker \
+        --config-file ${lib.escapeShellArg runtimeConfigFile} \
+        --api-sock ${lib.escapeShellArg (
+          if socket != null
+          then socket
+          else throw "Firecracker must be configured with an API socket (option microvm.socket)!"
+        )} \
+        ${lib.optionalString (lib.versionAtLeast firecrackerPkg.version "1.13.0") "--enable-pci \\"}
+        ${lib.escapeShellArgs microvmConfig.firecracker.extraArgs} \
+        "$@"
+    '';
 
   preStart = ''
     ${preStart}
+
+    ${pkgs.python3}/bin/python3 - <<'EOF'
+    import os
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path(${lib.escapeShellArg configFile}).read_text())
+    data["machine-config"]["vcpu_count"] = int(os.environ["MICROVM_VCPU"])
+    Path(${lib.escapeShellArg runtimeConfigFile}).write_text(json.dumps(data))
+    EOF
 
     if [ -e '${socket}' ]; then
       mv '${socket}' '${socket}.old'

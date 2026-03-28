@@ -1,6 +1,6 @@
 { pkgs
 , microvmConfig
-, macvtapFds
+, macvtapFd
 , ...
 }:
 
@@ -8,6 +8,7 @@ let
   inherit (pkgs) lib;
   inherit (pkgs.stdenv.hostPlatform) system;
   inherit (microvmConfig)
+    hostName
     vcpu mem balloon initialBalloonMem hotplugMem hotpluggedMem user volumes shares
     socket devices vsock graphics credentialFiles
     kernel initrdPath storeDisk storeOnDisk;
@@ -57,96 +58,54 @@ in {
     then throw "crosvm does not support hotpluggedMem"
     else if credentialFiles != {}
     then throw "crosvm does not support credentialFiles"
-    else lib.escapeShellArgs (
-      [
-        "${crosvmPkg}/bin/crosvm" "run"
-        "-m" (toString mem)
-        "-c" (toString vcpu)
-        "--serial" "type=stdout,console=true,stdin=true"
-        "-p" "console=ttyS0 reboot=k panic=1 ${toString microvmConfig.kernelParams}"
-      ]
-      ++
-      lib.optional (!balloon) "--no-balloon"
-      ++
-      lib.optionals storeOnDisk [
-        "-r" storeDisk
-      ]
-      ++
-      lib.optionals graphics.enable [
-        "--vhost-user" "gpu,socket=${graphics.socket}"
-      ]
-      ++
-      lib.optionals (builtins.compareVersions crosvmPkg.version "107.1" < 0) [
-        # workarounds
-        "--seccomp-log-failures"
-      ]
-      ++
-      lib.optionals (pivotRoot != null) [
-        "--pivot-root"
-        pivotRoot
-      ]
-      ++
-      lib.optionals (socket != null) [
-        "-s" socket
-      ]
-      ++
-      builtins.concatMap ({ image, direct, serial, readOnly, ... }:
-        [ "--block"
-          "${image},o_direct=${
-            lib.boolToString direct
-          },ro=${
-            lib.boolToString readOnly
-          }${
-            lib.optionalString (serial != null) ",id=${serial}"
-          }"
-        ]
-      ) volumes
-      ++
-      builtins.concatMap ({ proto, tag, source, socket, readOnly, ... }: {
-        "virtiofs" = [
-          "--vhost-user" "type=fs,socket=${socket}"
-        ];
-        "9p" = if readOnly then
-          throw "Readonly 9p share is not supported"
-        else [
-          "--shared-dir" "${source}:${tag}:type=p9"
-        ];
-      }.${proto}) shares
-      ++
-      (builtins.concatMap ({ id, type, mac, ... }: [
-        "--net"
-        (lib.concatStringsSep "," ([
-          ( if type == "tap"
-            then "tap-name=${id}"
+    else pkgs.writeShellScript "microvm-crosvm-command" ''
+      set -e
+
+      ${if microvmConfig.prettyProcnames then ''exec -a "microvm@${hostName}"'' else "exec"} ${crosvmPkg}/bin/crosvm run \
+        -m ${toString mem} \
+        -c "$MICROVM_VCPU" \
+        --serial type=stdout,console=true,stdin=true \
+        -p ${lib.escapeShellArg "console=ttyS0 reboot=k panic=1 ${toString microvmConfig.kernelParams}"} \
+        ${lib.optionalString (!balloon) "--no-balloon \\"}
+        ${lib.optionalString storeOnDisk "-r ${lib.escapeShellArg storeDisk} \\"}
+        ${lib.optionalString graphics.enable "--vhost-user ${lib.escapeShellArg "gpu,socket=${graphics.socket}"} \\"}
+        ${lib.optionalString (builtins.compareVersions crosvmPkg.version "107.1" < 0) "--seccomp-log-failures \\"}
+        ${lib.optionalString (pivotRoot != null) "--pivot-root ${lib.escapeShellArg pivotRoot} \\"}
+        ${lib.optionalString (socket != null) "-s ${lib.escapeShellArg socket} \\"}
+        ${lib.concatMapStrings ({ image, direct, serial, readOnly, ... }: ''
+          --block ${lib.escapeShellArg "${image},o_direct=${lib.boolToString direct},ro=${lib.boolToString readOnly}${lib.optionalString (serial != null) ",id=${serial}"}"} \
+        '') volumes}
+        ${lib.concatMapStrings ({ proto, tag, source, socket, readOnly, ... }: {
+          "virtiofs" = ''
+            --vhost-user ${lib.escapeShellArg "type=fs,socket=${socket}"} \
+          '';
+          "9p" = if readOnly then
+            throw "Readonly 9p share is not supported"
+          else ''
+            --shared-dir ${lib.escapeShellArg "${source}:${tag}:type=p9"} \
+          '';
+        }.${proto}) shares}
+        ${lib.concatMapStrings ({ id, type, mac, ... }: ''
+          --net ${
+            if type == "tap"
+            then lib.escapeShellArg "tap-name=${id},mac=${mac}"
             else if type == "macvtap"
-            then "tap-fd=${toString macvtapFds.${id}}"
+            then lib.escapeShellArg "tap-fd="
+              + "${macvtapFd id}"
+              + lib.escapeShellArg ",mac=${mac}"
             else throw "Unsupported interface type ${type} for crosvm"
-          )
-          "mac=${mac}"
-        # ] ++ lib.optionals (vcpu > 1) [
-        #   "vq-pairs=${toString vcpu}"
-        ]))
-      ]) microvmConfig.interfaces)
-      # ++
-      # lib.optionals (vcpu > 1) [
-      #   "--net-vq-pairs" (toString vcpu)
-      # ]
-      ++
-      lib.optionals (vsock.cid != null) [
-        "--vsock" (toString vsock.cid)
-      ]
-      ++
-      [
-        "--initrd" initrdPath
-        kernelPath
-      ]
-    )
-    + " " + # Move vfio-pci outside of
-      lib.concatStringsSep " " (lib.concatMap ({ bus, path, ... }: {
-        pci = [ "--vfio" "/sys/bus/pci/devices/${path},iommu=viommu" ];
-        usb = throw "USB passthrough is not supported on crosvm";
-      }.${bus}) devices)
-    + " " + lib.escapeShellArgs extraArgs;
+          } \
+        '') microvmConfig.interfaces}
+        ${lib.optionalString (vsock.cid != null) "--vsock ${toString vsock.cid} \\"}
+        --initrd ${lib.escapeShellArg initrdPath} \
+        ${lib.concatMapStrings ({ bus, path, ... }: {
+          pci = "--vfio ${lib.escapeShellArg "/sys/bus/pci/devices/${path},iommu=viommu"} \\";
+          usb = throw "USB passthrough is not supported on crosvm";
+        }.${bus}) devices}
+        ${lib.escapeShellArg kernelPath} \
+        ${lib.optionalString (extraArgs != []) "${lib.escapeShellArgs extraArgs} \\"}
+        "$@"
+    '';
 
   canShutdown = socket != null;
 

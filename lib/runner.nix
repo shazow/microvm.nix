@@ -12,10 +12,10 @@ let
   inherit (import ./volumes.nix { pkgs = microvmConfig.vmHostPackages; }) createVolumesScript;
   inherit (makeMacvtap {
     inherit microvmConfig hypervisorConfig;
-  }) openMacvtapFds macvtapFds;
+  }) openMacvtapFds macvtapFd macvtapFdColonList macvtapFdCsvList;
 
   hypervisorConfig = import (./runners + "/${microvmConfig.hypervisor}.nix") {
-    inherit pkgs microvmConfig macvtapFds withDriveLetters extractOptValues extractParamValue;
+    inherit pkgs microvmConfig macvtapFd macvtapFdColonList macvtapFdCsvList withDriveLetters extractOptValues extractParamValue;
   };
 
   inherit (hypervisorConfig) command canShutdown shutdownCommand;
@@ -25,6 +25,42 @@ let
   setBalloonScript = hypervisorConfig.setBalloonScript or null;
 
   execArg = lib.optionalString microvmConfig.prettyProcnames ''-a "microvm@${hostName}"'';
+  rawVcpu = toString microvmConfig.vcpu;
+  resolveVcpuScript = ''
+    MICROVM_VCPU_EXPR=$(cat <<'EOF'
+${rawVcpu}
+EOF
+    )
+    MICROVM_VCPU=$(eval "printf '%s' \"$MICROVM_VCPU_EXPR\"")
+
+    case "$MICROVM_VCPU" in
+      ""|*[!0-9]*)
+        echo "Invalid resolved value for microvm.vcpu: $MICROVM_VCPU" >&2
+        exit 1
+        ;;
+    esac
+
+    if [ "$MICROVM_VCPU" -lt 1 ]; then
+      echo "microvm.vcpu must resolve to a positive integer, got: $MICROVM_VCPU" >&2
+      exit 1
+    fi
+
+    if [ ${if tapMultiQueue then "1" else "0"} -eq 1 ] && [ "$MICROVM_VCPU" -gt 1 ]; then
+      MICROVM_TAP_MULTI_QUEUE=1
+    else
+      MICROVM_TAP_MULTI_QUEUE=0
+    fi
+
+    MICROVM_VCPU_X2=$((MICROVM_VCPU * 2))
+    MICROVM_VCPU_X2_PLUS2=$((MICROVM_VCPU_X2 + 2))
+    if [ "$MICROVM_VCPU" -lt 16 ]; then
+      MICROVM_VCPU_MIN16="$MICROVM_VCPU"
+    else
+      MICROVM_VCPU_MIN16=16
+    fi
+
+    export MICROVM_VCPU MICROVM_TAP_MULTI_QUEUE MICROVM_VCPU_X2 MICROVM_VCPU_X2_PLUS2 MICROVM_VCPU_MIN16
+  '';
 
   # TAP interface names for machined registration
   tapInterfaces = lib.filter (i: i.type == "tap" && i ? id) microvmConfig.interfaces;
@@ -171,6 +207,7 @@ let
     // {
       microvm-run = ''
         set -eou pipefail
+        ${resolveVcpuScript}
         ${preStart}
         ${createVolumesScript microvmConfig.volumes}
         ${lib.optionalString (hypervisorConfig.requiresMacvtapAsFds or false) openMacvtapFds}
