@@ -1,244 +1,149 @@
-# Runtime-Resolved `microvm.vcpu` Fresh Attempt Spec
+# Runtime-Resolved `microvm.vcpu` Next Iteration Spec
 
 ## Purpose
 
 This document captures:
 
-- The recommended fresh-attempt plan after implementing the broader solution currently on branch `qemu-nproc` at commit `beddfe4`
-- What the broader diff against `main` taught us
-- A phased path that keeps risk and review surface small
+- what has already landed for runtime-resolved `microvm.vcpu`
+- what the next iteration should implement
+- the boundaries that should keep the next patch small and reviewable
 
-The current branch demonstrates that the full end-to-end idea works, but it also shows that generalizing too early creates avoidable complexity. A fresh attempt should start smaller.
+This is no longer a "fresh attempt" note. The qemu-only non-`macvtap` path is implemented already. The next patch should extend that work without reopening the broader all-runners design.
 
-## Current Diff Summary
+## Current Status
 
-Compared to `main`, the current branch changes:
+The current branch has already landed the minimal qemu-first implementation in:
 
-- `microvm.vcpu` from an integer-only option to a string-or-int option
-- Runtime launch plumbing in `lib/runner.nix`
-- Host TAP setup in `nixos-modules/microvm/interfaces.nix`
-- macvtap FD handling in `lib/macvtap.nix`
-- Every major runner:
-  - `qemu`
-  - `cloud-hypervisor`
-  - `firecracker`
-  - `crosvm`
-  - `kvmtool`
-  - `alioth`
-  - `stratovirt`
-  - `vfkit`
-- Docs and tests
+- `6f31464` `Add qemu runtime support for nproc vcpu`
+- `36418fb` `Clarify vcpu string semantics`
 
-That broad scope proved the concept, but it is larger than necessary for a first upstreamable patch.
+That implementation currently provides:
 
-## Step 1: Minimal QEMU-Only Implementation
+- `microvm.vcpu` as a string-or-int option, matching the `microvm.virtiofsd.threadPoolSize` model
+- qemu support for runtime-resolved string `vcpu` values on non-`macvtap` configurations
+- one exported runtime value, `MICROVM_VCPU`
+- runtime validation of the resolved value in `microvm-run`
+- qemu TAP handling that resolves string `vcpu` at runtime and enables `multi_queue` only when the resolved count is greater than 1
+- explicit assertions that reject:
+  - string `vcpu` on non-qemu hypervisors
+  - qemu with string `vcpu` plus `macvtap`
+- focused docs and tests for the qemu non-`macvtap` path
 
-This should be the first fresh-attempt patch.
+## What Remains
 
-### Goal
+The main missing qemu piece is:
 
-Support runtime-resolved `microvm.vcpu` only for:
+- qemu `macvtap` support when `microvm.vcpu` is a string
+
+After that, the next reasonable backend to consider remains:
+
+- firecracker
+
+But the immediate next iteration should be only qemu `macvtap`.
+
+## Next Iteration Goal
+
+Support runtime-resolved string `microvm.vcpu` for:
 
 - `microvm.hypervisor = "qemu"`
-- non-`macvtap` qemu configurations
+- qemu configurations using `type = "macvtap"`
 
-### Behavior
+The new work should preserve all behavior already implemented for:
 
-- `microvm.vcpu` accepts either:
+- integer `vcpu`
+- qemu + TAP
+- qemu process naming
+- existing extra-args passthrough
+- current open-FD semantics for `macvtap`
+
+## Required Behavior
+
+- `microvm.vcpu` continues to accept:
   - a positive integer
   - a string value such as `` `nproc` ``
-- The string is resolved on the runtime host
-- The resolved value must be a positive integer
+- The string continues to be resolved on the runtime host.
+- The resolved value must continue to be validated as a positive integer before qemu consumes it.
+- qemu `macvtap` must work when the queue count depends on the resolved runtime CPU count.
+- Existing integer `vcpu` behavior must remain unchanged.
 
-### Implementation boundaries
+## Scope
 
-- Touch only:
-  - `nixos-modules/microvm/options.nix`
-  - `nixos-modules/microvm/asserts.nix`
-  - `nixos-modules/microvm/interfaces.nix`
-  - `lib/runner.nix`
-  - `lib/runners/qemu.nix`
-  - qemu-focused docs/tests
-- Do not change:
-  - `lib/macvtap.nix`
-  - non-qemu runners
-  - generalized runtime helper surfaces
+The next patch should touch only what qemu `macvtap` needs:
 
-### Assertions
+- `lib/macvtap.nix`
+- qemu-specific runtime plumbing where required
+- qemu-focused tests
+- docs if the user-visible behavior changes
 
-Add explicit assertions:
+It should not:
 
-- If `microvm.vcpu` is a string, `microvm.hypervisor` must be `qemu`
-- If `microvm.vcpu` is a string, qemu `macvtap` interfaces are unsupported for now
+- add support for other hypervisors
+- introduce generic cross-backend helper env vars unless they are clearly unavoidable
+- restructure unrelated runner code just for symmetry
 
-### Runtime plumbing
+## Design Constraints
 
-- Export exactly one runtime value:
-  - `MICROVM_VCPU`
-- Validate it in `microvm-run`
-- Do not add precomputed helper env vars such as:
-  - `MICROVM_VCPU_X2`
-  - `MICROVM_VCPU_X2_PLUS2`
-  - `MICROVM_VCPU_MIN16`
+### 1. Keep values concrete before shell boundaries
 
-### QEMU-specific handling
+`macvtap` is different from TAP because queue-dependent behavior affects FD layout. The next patch should prefer computing qemu-specific concrete values before they cross any wrapper-shell boundary.
 
-- Keep qemu as close to `main` as possible
-- Use inline shell arithmetic where needed inside qemu-only runtime code
-- Add a short TODO near `vectors=` / queue sizing noting future optimization opportunities
+### 2. Preserve final process naming
 
-### TAP handling
+If a wrapper script becomes necessary, `prettyProcnames` must still apply to the actual qemu process, not just to a wrapper shell.
 
-- For integer `vcpu`, keep current behavior
-- For qemu string `vcpu`, resolve at runtime in `tap-up`
-- Add `multi_queue` only when the resolved CPU count is greater than 1
+### 3. Preserve runtime arg passthrough
 
-### Tests
+Any qemu-specific wrapper or command restructuring must continue to preserve runtime extra arguments exactly as today.
 
-- One positive qemu test with `` microvm.vcpu = "`nproc`" ``
-- One negative restriction test for string `vcpu` on a non-qemu hypervisor
-- One negative restriction test for qemu + string `vcpu` + `macvtap`
+### 4. Preserve FD semantics
 
-## Step 2: QEMU `macvtap` Support
+Open `macvtap` file descriptors must remain visible where qemu needs them. Avoid designs that accidentally hide helper functions or FD state behind an extra shell boundary.
 
-Only do this after Step 1 lands cleanly.
+### 5. Keep helper surface minimal
 
-### Why this is separate
+The current design intentionally exports only:
 
-`macvtap` forces runtime FD layout decisions when queue counts depend on runtime `vcpu`. That pulls `lib/macvtap.nix` into scope and increases risk noticeably.
+- `MICROVM_VCPU`
 
-### Scope
+The next iteration should continue that approach unless qemu `macvtap` support proves that another concrete runtime value is truly necessary. If another value is needed, keep it qemu-local rather than introducing an early generic abstraction.
 
-- Update `lib/macvtap.nix` only as needed
-- Preserve qemu process naming and existing FD semantics
-- Add focused qemu `macvtap` coverage
+## Implementation Guidance
 
-### Design guidance
+- Start from the current branch state, not from the old broad prototype.
+- Update `lib/macvtap.nix` only as far as required to let qemu consume the correct runtime FD layout.
+- Prefer qemu-local logic over frameworking.
+- Keep the non-`macvtap` qemu path as unchanged as possible.
+- Add small qemu-local TODOs instead of over-solving future backend needs.
 
-- Prefer computing only what qemu needs
-- Keep values concrete before they cross any wrapper-shell boundary
-- Avoid introducing generic abstractions unless another backend truly needs the same shape
+## Tests
 
-## Step 3: Add Firecracker
+The next patch should add focused coverage for qemu `macvtap` with string `vcpu`.
 
-Firecracker is the next best candidate after qemu.
+Minimum test additions:
 
-### Why
+- one positive qemu + string `vcpu` + `macvtap` test
+- coverage that exercises queue-dependent `macvtap` FD behavior
 
-- It has a small CPU surface area
-- The main extra work is runtime JSON generation for `vcpu_count`
+Existing negative coverage for qemu + string `vcpu` + `macvtap` should be updated or replaced once support lands.
 
-### Scope
+## Still Out Of Scope
 
-- Limit changes to `lib/runners/firecracker.nix`
-- Reuse the same single runtime value, `MICROVM_VCPU`
-- Do not generalize other runner plumbing yet
+Do not combine qemu `macvtap` support with:
 
-## Step 4: Add Simple CLI Backends
+- firecracker support
+- crosvm, kvmtool, or vfkit support
+- cloud-hypervisor, alioth, or stratovirt queue-derived support
+- generalized helper env var design for all backends
 
-After qemu and firecracker, consider:
+Those can be revisited only after qemu `macvtap` lands cleanly.
 
-- `crosvm`
-- `kvmtool`
-- `vfkit`
+## Success Criteria
 
-### Why
+The next iteration is successful when:
 
-These are comparatively simple because `vcpu` is mostly a direct CLI argument, but they still need careful treatment of:
-
-- extra args
-- process naming
-- any runtime shell boundary introduced by implementation choices
-
-## Step 5: Add Complex Queue-Derived Backends
-
-Leave these for last:
-
-- `cloud-hypervisor`
-- `alioth`
-- `stratovirt`
-
-### Why
-
-These runners use `vcpu` not just for CPU count, but also for:
-
-- queue counts
-- vector counts
-- other derived runtime settings
-
-This is where generalized helper variables are tempting. The current branch shows that introducing those early increases complexity and review burden.
-
-## Lessons From The Current Broad Implementation
-
-### 1. Generalizing early made the patch much larger than necessary
-
-The current branch touched 15 files and every major runner. That widened the review surface before the qemu-only path was settled.
-
-### 2. Wrapper scripts create hidden boundary problems
-
-Moving command construction into wrapper scripts introduced regressions that had to be fixed later:
-
-- macvtap fd helper functions were no longer visible across the shell boundary
-- `prettyProcnames` applied to the wrapper instead of the actual hypervisor process
-- runner-specific extras such as `crosvm.extraArgs` were easy to drop accidentally
-
-Fresh attempt guidance:
-
-- Avoid wrapper scripts unless they are clearly required
-- If a wrapper is required, preserve:
-  - process naming on the final hypervisor process
-  - runtime args passthrough
-  - shell-boundary-sensitive values such as open FDs
-
-### 3. One runtime value is easier to reason about than many derived env vars
-
-The current branch introduced several precomputed helper values. That works, but it obscures what each backend actually needs.
-
-Fresh attempt guidance:
-
-- Start with `MICROVM_VCPU` only
-- Do inline qemu arithmetic where required
-- Add derived helpers only when repeated backend usage proves they are worth it
-
-### 4. `virtiofsd.threadPoolSize` already established the runtime-string pattern
-
-The current branch confirmed that `virtiofsd.threadPoolSize` already accepts string values such as `\`nproc\``. It works because the string is interpolated directly into a shell command.
-
-Fresh attempt guidance:
-
-- Mirror that behavior deliberately for `microvm.vcpu`
-- Still validate the resolved result before passing it to the hypervisor
-
-### 5. Host-side networking is part of the feature
-
-For qemu, this is not only about `-smp`. TAP `multi_queue` behavior must match the resolved CPU count.
-
-Fresh attempt guidance:
-
-- Treat host interface setup as part of the qemu implementation, not as optional follow-up
-- Keep `macvtap` out of scope initially to avoid pulling in FD-layout complexity
-
-## Guidance For A Future Fresh Attempt
-
-Start from `main`, not from the broad branch, and keep the first patch intentionally small.
-
-Recommended sequence:
-
-1. Implement qemu-only string `vcpu` support with one runtime value and two explicit restriction assertions.
-2. Add qemu TAP runtime handling and the minimal positive/negative tests.
-3. Land that first.
-4. Add qemu `macvtap` only after the qemu-only core is stable.
-5. Expand backend support one hypervisor family at a time.
-
-Code-review guidance:
-
-- Prefer small backend-specific runtime logic over early frameworking
-- Keep diffs local to the backend being enabled
-- Add TODOs for optimization opportunities instead of solving every derived-value case in v1
-
-Success criteria for the fresh attempt:
-
-- Small diff against `main`
-- qemu string `vcpu` works with TAP
-- unsupported combinations fail with clear assertions
-- no changes to unrelated hypervisors in the first patch
+- qemu supports string `microvm.vcpu` with `macvtap`
+- integer `vcpu` behavior is unchanged
+- qemu TAP behavior remains unchanged
+- qemu process naming and runtime arg passthrough remain correct
+- `macvtap` FD handling still works with runtime-resolved queue counts
+- the patch stays local to qemu `macvtap` concerns rather than reopening the broad all-runners design
